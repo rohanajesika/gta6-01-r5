@@ -1,79 +1,93 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=start|play|end. Each one plays the real
+// rules forward from a fresh world for a fixed number of steps, steered by a
+// simple autopilot that drives the road grid, so the frame is what a short
+// game really looks like and the same seed always gives the same frame.
+
+import { STEP } from './config.js';
 
 const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const PLAY_SECONDS = 8;
+const END_SECONDS = 3;
+const IDLE_DRIVER = { forward: 0, strafe: 0, run: false, actions: 0 };
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function wrapAngle(angle) {
+  while (angle > Math.PI) angle -= Math.PI * 2;
+  while (angle < -Math.PI) angle += Math.PI * 2;
+  return angle;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+/** Drive `car` along `waypoints` ([x, z] pairs on roads) for one step. */
+function autopilotDriver(car, waypoints, current) {
+  const target = waypoints[current.index];
+  if (!target) return { forward: 0, strafe: 0, run: false, actions: 0 };
+  const dx = target[0] - car.x;
+  const dz = target[1] - car.z;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  if (dist < 4) {
+    current.index += 1;
+    return autopilotDriver(car, waypoints, current);
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+  const desired = Math.atan2(dx, dz);
+  const turn = wrapAngle(desired - car.heading);
+  const steer = Math.max(-1, Math.min(1, turn * 2));
+  const last = current.index === waypoints.length - 1;
+  const forward = last && dist < 14 ? 0.35 : 1;
+  return { forward, strafe: steer, run: false, actions: 0 };
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set the game `G` to the named scene (start, play or end; any other name is
+ * start) and return the screen to draw and whether the camera should orbit.
+ * `stepWorld` and `updateCamera` are main.js's own functions, passed in so
+ * this file stays free of the loop.
  */
-export function stageShot(name, world) {
-  world.reset();
+export function stageShot(name, G, stepWorld, updateCamera) {
   if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+    for (let i = 0; i < START_SECONDS / STEP; i += 1) stepWorld(STEP, IDLE_DRIVER);
+    return { screen: 'title', orbit: true };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'play') {
+    // A chase in progress: Raka driving the sedan up Coral Ave toward Mira's
+    // garage, two stars of heat and police cars closing in behind him.
+    G.missionsStarted = true;
+    G.missions.startMission(0, G);
+    const sedan = G.missions.state.sedan;
+    const p = G.player.state;
+    p.inCar = sedan;
+    p.mesh.visible = false;
+    sedan.stolen = true;
+    G.police.setWanted(2);
+    // Stepping once lets the mission see Raka in the sedan and point at the garage.
+    stepWorld(STEP, IDLE_DRIVER);
+    // Drive north up the avenue, then east along Palm Row to the garage. The
+    // frame is taken just as the car arrives, still moving, mission complete.
+    const waypoints = [[68, 124], [124, 124]];
+    const current = { index: 0 };
+    for (let i = 0; i < PLAY_SECONDS / STEP; i += 1) {
+      stepWorld(STEP, autopilotDriver(sedan, waypoints, current));
+      updateCamera(STEP, false);
+    }
+    return { screen: 'play', orbit: false };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  // The end: every job done, Raka on foot at the marina plaza beside his car,
+  // facing back toward the city skyline, the palms behind the camera.
+  G.missionsStarted = true;
+  G.missions.state.done = true;
+  G.money = 2100;
+  G.bestMoney = Math.max(G.bestMoney, 2100);
+  G.player.reset(160, 168, Math.PI);
+  G.vehicles.makeDrivableCar(150, 162, Math.PI / 2, 0x16a085, false);
+  // Snap the camera behind the player now: the shot only paints two frames,
+  // far too few for the follow yaw to swing around on its own.
+  G.camYaw = Math.PI;
+  G.orbitOffset = 0;
+  // Look far past the player so the city skyline, not just the plaza, is in frame.
+  G.camLookAhead = 50;
+  G.missions.state.banner = 'SOLMAR LEGEND — All jobs done. The Bay is yours.';
+  G.missions.state.bannerUntil = G.time + 8;
+  G.police.setWanted(0);
+  for (let i = 0; i < END_SECONDS / STEP; i += 1) stepWorld(STEP, IDLE_DRIVER);
+  return { screen: 'play', orbit: false };
 }
